@@ -21,15 +21,24 @@ final class DashboardWindowController {
                 .environmentObject(history)
         )
 
+        let neverTakesFocus = layoutEngine.document.globalSettings.dashboardNeverTakesFocus
+        DashboardFocus.neverTakesFocus = neverTakesFocus
+        // Whether the panel activates the app is fixed when it's created, so a
+        // changed setting replaces the window.
+        if let existing = window as? KioskWindow, existing.neverActivates != neverTakesFocus {
+            existing.orderOut(nil)
+            existing.contentView = nil
+            existing.close()
+            window = nil
+        }
+
         let dashboardWindow: NSWindow
         if let existing = window {
             dashboardWindow = existing
         } else {
             let created = KioskWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1440, height: 405),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                backing: .buffered,
-                defer: false
+                neverActivates: neverTakesFocus
             )
             created.title = "EdgeControl"
             created.isReleasedWhenClosed = false
@@ -52,7 +61,8 @@ final class DashboardWindowController {
 
         if placed {
             dashboardWindow.orderFrontRegardless()
-            dashboardWindow.makeKeyAndOrderFront(nil)
+            // Shown, not focused: focus stays on the display you're using.
+            if !neverTakesFocus { dashboardWindow.makeKeyAndOrderFront(nil) }
         } else {
             // strictMonitorAffinity is on AND the preferred screen is absent;
             // no target exists — keep the window parked off-screen rather than
@@ -120,10 +130,23 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
             history: history,
             pluginManager: pluginManager
         )
-        NSApp.activate(ignoringOtherApps: true)
         // One-time offer to import gh/tea logins; no-op once shown or once
         // an account exists.
         cicdImportPrompt.offerIfNeeded(model: model)
+        AccessibilityExposure.alwaysExpose = layoutEngine.document.globalSettings.alwaysExposeAccessibility
+        if layoutEngine.document.globalSettings.dashboardNeverTakesFocus {
+            // macOS activates an app it launches; hand focus straight back to
+            // whatever you were using (unless a prompt window wants you).
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(600))
+                DashboardFocus.releaseIfIdle()
+            }
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(dashboardFocusSettingChanged),
+            name: DashboardFocus.settingChanged, object: nil)
 
         // Re-pin to the configured display whenever the screen topology
         // changes (target display sleep/wake, monitor unplug, dock change),
@@ -231,6 +254,24 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
             model.touchService.start()
             touchSuspendedForDisplay = false
         }
+    }
+
+    /// Rebuilds the dashboard window with the new focus behaviour.
+    @objc private func dashboardFocusSettingChanged() {
+        dashboardWindowController.show(
+            model: model, layoutEngine: layoutEngine, registry: registry,
+            history: history, pluginManager: pluginManager)
+    }
+
+    /// Switching to EdgeControl on purpose (Cmd-Tab, the Dock, Voice
+    /// Control's "Open EdgeControl") puts the keyboard on the dashboard, so
+    /// Full Keyboard Access and Voice Control can work in it. Switching to
+    /// another app gives focus back as usual.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard DashboardFocus.neverTakesFocus, NSApp.keyWindow == nil,
+            let dashboard = DashboardFocus.dashboard, dashboard.isVisible
+        else { return }
+        dashboard.makeKey()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -393,10 +434,24 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
                 action: #selector(openSettings(_:)),
                 keyEquivalent: ","
             ))
+        // The keyboard way into the dashboard when it's hidden from the Dock
+        // (no Cmd-Tab entry): menu bar extras are reachable with Control-F8.
+        menu.addItem(
+            NSMenuItem(
+                title: "Use Dashboard with Keyboard",
+                action: #selector(useDashboardWithKeyboard(_:)),
+                keyEquivalent: ""
+            ))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit EdgeControl", action: #selector(quitApp(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         return menu
+    }
+
+    @objc private func useDashboardWithKeyboard(_ sender: Any?) {
+        guard let dashboard = DashboardFocus.dashboard else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        dashboard.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openSettings(_ sender: Any?) {
