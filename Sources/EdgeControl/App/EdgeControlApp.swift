@@ -21,15 +21,24 @@ final class DashboardWindowController {
                 .environmentObject(history)
         )
 
+        let neverTakesFocus = layoutEngine.document.globalSettings.dashboardNeverTakesFocus
+        DashboardFocus.neverTakesFocus = neverTakesFocus
+        // Whether the panel activates the app is fixed when it's created, so a
+        // changed setting replaces the window.
+        if let existing = window as? KioskWindow, existing.neverActivates != neverTakesFocus {
+            existing.orderOut(nil)
+            existing.contentView = nil
+            existing.close()
+            window = nil
+        }
+
         let dashboardWindow: NSWindow
         if let existing = window {
             dashboardWindow = existing
         } else {
             let created = KioskWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1440, height: 405),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                backing: .buffered,
-                defer: false
+                neverActivates: neverTakesFocus
             )
             created.title = "EdgeControl"
             created.isReleasedWhenClosed = false
@@ -46,14 +55,16 @@ final class DashboardWindowController {
             dashboardWindow,
             display: model.selectedDisplay,
             kioskMode: layoutEngine.document.globalSettings.kioskMode,
+            preferredDisplayName: model.selectedDisplayName,
             strictMonitorAffinity: layoutEngine.document.globalSettings.strictMonitorAffinity
         )
 
         if placed {
             dashboardWindow.orderFrontRegardless()
-            dashboardWindow.makeKeyAndOrderFront(nil)
+            // Shown, not focused: focus stays on the display you're using.
+            if !neverTakesFocus { dashboardWindow.makeKeyAndOrderFront(nil) }
         } else {
-            // strictMonitorAffinity is on AND no eligible non-main screen
+            // strictMonitorAffinity is on AND the preferred screen is absent; no target
             // exists — keep the window parked off-screen rather than
             // surfacing it on the main display.
             dashboardWindow.orderOut(nil)
@@ -81,6 +92,8 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
     private let history: MetricsHistory
     private let pluginManager: PluginManager
     private let dashboardWindowController = DashboardWindowController()
+    private var repinGeneration = 0
+    private var touchSuspendedForDisplay = false
     private var statusItem: NSStatusItem?
 
     init(
@@ -115,10 +128,24 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
             history: history,
             pluginManager: pluginManager
         )
-        NSApp.activate(ignoringOtherApps: true)
         // One-time offer to import gh/tea logins; no-op once shown or once
         // an account exists.
         cicdImportPrompt.offerIfNeeded(model: model)
+        model.touchService.setDiagnostics(layoutEngine.document.globalSettings.debugMode)
+        AccessibilityExposure.alwaysExpose = layoutEngine.document.globalSettings.alwaysExposeAccessibility
+        if layoutEngine.document.globalSettings.dashboardNeverTakesFocus {
+            // macOS activates an app it launches; hand focus straight back to
+            // whatever you were using (unless a prompt window wants you).
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(600))
+                DashboardFocus.releaseIfIdle()
+            }
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(dashboardFocusSettingChanged),
+            name: DashboardFocus.settingChanged, object: nil)
 
         // Re-pin to the configured display whenever the screen topology
         // changes (target display sleep/wake, monitor unplug, dock change),
@@ -162,6 +189,53 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
                 object: nil,
             )
         }
+
+        // Media stays paused after wake / unlock, matching Apple Music. The
+        // pause sent at sleep is asynchronous in WebKit and may not land
+        // before the system suspends, so repeat it on the way back.
+        for name in [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification,
+        ] {
+            wsNc.addObserver(
+                self,
+                selector: #selector(keepMediaPausedAfterWake),
+                name: name,
+                object: nil,
+            )
+        }
+        observeScreenLock()
+    }
+
+    /// Rebuilds the dashboard window with the new focus behaviour.
+    @objc private func dashboardFocusSettingChanged() {
+        dashboardWindowController.show(
+            model: model, layoutEngine: layoutEngine, registry: registry,
+            history: history, pluginManager: pluginManager)
+    }
+
+    @objc private func keepMediaPausedAfterWake() {
+        YouTubeSessions.shared.pauseAll()
+    }
+
+    /// Locking the screen (Control-Command-Q) posts no NSWorkspace session
+    /// notification — sessionDidResignActive is for switching users — so
+    /// listen for the screen-lock broadcast as well. Media only; the dashboard
+    /// stays placed behind the lock screen.
+    private func observeScreenLock() {
+        let center = DistributedNotificationCenter.default()
+        center.addObserver(
+            self, selector: #selector(pauseMediaForLock),
+            name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        center.addObserver(
+            self, selector: #selector(keepMediaPausedAfterWake),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+    }
+
+    @objc private func pauseMediaForLock() {
+        YouTubeSessions.shared.pauseAll()
+        AppleMusicModel.shared.pause()
     }
 
     /// On wake / session-active, the target display often isn't yet in
@@ -171,7 +245,8 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
     /// display. Instead we retry on a short backoff until the target
     /// screen appears or we've burned a reasonable budget.
     @objc private func repinDashboard() {
-        retryRepin(attempt: 0)
+        repinGeneration += 1
+        retryRepin(attempt: 0, generation: repinGeneration)
     }
 
     /// Hide the window pre-emptively when the screen is about to sleep
@@ -179,7 +254,20 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
     /// briefly relocating the window to the main display before our
     /// wake handler fires.
     @objc private func parkDashboard() {
+        repinGeneration += 1
         dashboardWindowController.hide()
+        YouTubeSessions.shared.pauseAll()
+        AppleMusicModel.shared.pause()
+    }
+
+    private func waitForMissingDisplay() {
+        dashboardWindowController.hide()
+        if !touchSuspendedForDisplay {
+            YouTubeSessions.shared.pauseAll()
+            AppleMusicModel.shared.pause()
+            model.touchService.stop()
+            touchSuspendedForDisplay = true
+        }
     }
 
     // Backoff schedule: try right away, then doubling out to 60s. Once the
@@ -188,34 +276,41 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
         0, 0.5, 1.5, 3, 6, 12, 30, 60, 60, 60,
     ]
 
-    private func retryRepin(attempt: Int) {
-        // Hard ceiling at 10 attempts (~ 4 minutes) — beyond that something
-        // is wrong with the target display that won't resolve without user
-        // action. The window stays hidden meanwhile rather than parking on
-        // the wrong display.
-        guard attempt < Self.repinAttemptDelays.count else { return }
-        let delay = Self.repinAttemptDelays[attempt]
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            let targetName = self.model.selectedDisplay?.name
-            let targetPresent = NSScreen.screens.contains { $0.localizedName == targetName }
-            if targetPresent || targetName == nil {
-                // Target available (or no specific target configured) →
-                // place + done.
-                self.dashboardWindowController.show(
-                    model: self.model,
-                    layoutEngine: self.layoutEngine,
-                    registry: self.registry,
-                    history: self.history,
-                    pluginManager: self.pluginManager,
-                )
-            } else {
-                // Target not enumerated yet — hide the window so it doesn't
-                // flash onto the main display, and try again later.
-                self.dashboardWindowController.hide()
-                self.retryRepin(attempt: attempt + 1)
+    private func retryRepin(attempt: Int, generation: Int) {
+        guard generation == repinGeneration, attempt < Self.repinAttemptDelays.count else { return }
+        model.refreshDisplays()
+        let preferred = model.selectedDisplayName
+        let strict =
+            layoutEngine.document.globalSettings.strictMonitorAffinity
+            && layoutEngine.document.globalSettings.kioskMode
+        let missing = preferred != nil && model.selectedDisplay == nil
+        if strict && missing {
+            waitForMissingDisplay()
+            let next = attempt + 1
+            guard next < Self.repinAttemptDelays.count else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.repinAttemptDelays[next]) { [weak self] in
+                self?.retryRepin(attempt: next, generation: generation)
             }
+            return
         }
+        dashboardWindowController.show(
+            model: model, layoutEngine: layoutEngine,
+            registry: registry, history: history, pluginManager: pluginManager)
+        if touchSuspendedForDisplay && !missing {
+            model.touchService.start()
+            touchSuspendedForDisplay = false
+        }
+    }
+
+    /// Switching to EdgeControl on purpose (Cmd-Tab, the Dock, Voice
+    /// Control's "Open EdgeControl") puts the keyboard on the dashboard,
+    /// so Full Keyboard Access and Voice Control can work in it. Switching to
+    /// another app gives focus back as usual.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard DashboardFocus.neverTakesFocus, NSApp.keyWindow == nil,
+            let dashboard = DashboardFocus.dashboard, dashboard.isVisible
+        else { return }
+        dashboard.makeKey()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -223,6 +318,7 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        AppleMusicModel.shared.pause()
         model.widgetDataBridge?.flush()
         model.stop()
         // Flush any pending debounced layout save
@@ -378,10 +474,24 @@ final class EdgeControlAppDelegate: NSObject, NSApplicationDelegate {
                 action: #selector(openSettings(_:)),
                 keyEquivalent: ","
             ))
+        // The keyboard way into the dashboard when it's hidden from the Dock
+        // (no Cmd-Tab entry): menu bar extras are reachable with Control-F8.
+        menu.addItem(
+            NSMenuItem(
+                title: "Use Dashboard with Keyboard",
+                action: #selector(useDashboardWithKeyboard(_:)),
+                keyEquivalent: ""
+            ))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit EdgeControl", action: #selector(quitApp(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         return menu
+    }
+
+    @objc private func useDashboardWithKeyboard(_ sender: Any?) {
+        guard let dashboard = DashboardFocus.dashboard else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        dashboard.makeKeyAndOrderFront(nil)
     }
 
     @objc private func openSettings(_ sender: Any?) {

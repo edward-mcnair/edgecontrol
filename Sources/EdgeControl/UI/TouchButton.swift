@@ -14,6 +14,10 @@ struct TouchButton: View {
     let isActive: Bool
     let activeColor: Color
     let registry: TouchZoneRegistry
+    /// Spoken name for icon-only buttons whose visible label is blank.
+    var accessibilityName: String? = nil
+    /// Extra touch area around the visible button, for small targets.
+    var hitSlop: CGSize = .zero
     let action: @Sendable () -> Void
 
     var body: some View {
@@ -34,15 +38,22 @@ struct TouchButton: View {
             .onTapGesture {
                 action()
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityName ?? label)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { action() }
             .background(
                 GeometryReader { geo in
                     Color.clear
                         .onAppear {
                             let frame = geo.frame(in: .named(TouchCoordinate.name))
-                            registry.register(id: id, frame: frame, action: action)
+                            registry.register(
+                                id: id, frame: frame.insetBy(dx: -hitSlop.width, dy: -hitSlop.height), action: action)
                         }
                         .onChange(of: geo.frame(in: .named(TouchCoordinate.name))) { _, newFrame in
-                            registry.register(id: id, frame: newFrame, action: action)
+                            registry.register(
+                                id: id, frame: newFrame.insetBy(dx: -hitSlop.width, dy: -hitSlop.height), action: action
+                            )
                         }
                 }
             )

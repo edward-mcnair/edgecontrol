@@ -16,6 +16,16 @@ struct DashboardShell: View {
         Theme.accent(layoutEngine.document.globalSettings.theme)
     }
 
+    private var mediaInstanceIDs: [String] {
+        var ids: [String] = []
+        for page in layoutEngine.document.pages {
+            for widget in page.widgets where widget.widgetId == "youtube" {
+                ids.append(widget.instanceId)
+            }
+        }
+        return ids
+    }
+
     var body: some View {
         GeometryReader { geo in
             let grid = DynamicGrid.calculate(width: geo.size.width, height: geo.size.height)
@@ -141,9 +151,13 @@ struct DashboardShell: View {
                 }
             }
         }
+        .overlay { CalibrationOverlay(service: model.touchService) }
         .themeSettings(layoutEngine.document.globalSettings.theme)
         .unitSystem(layoutEngine.document.globalSettings.units)
         .coordinateSpace(name: TouchCoordinate.name)
+        .onChange(of: mediaInstanceIDs) { _, ids in
+            YouTubeSessions.shared.retainOnly(Set(ids))
+        }
         .onChange(of: model.systemMetrics) { _, newMetrics in
             if let m = newMetrics {
                 history.record(cpu: m.cpuLoadPercent, memory: m.memoryUsedPercent)
@@ -155,6 +169,7 @@ struct DashboardShell: View {
                     window,
                     display: model.selectedDisplay,
                     kioskMode: layoutEngine.document.globalSettings.kioskMode,
+                    preferredDisplayName: model.selectedDisplayName,
                     strictMonitorAffinity: layoutEngine.document.globalSettings.strictMonitorAffinity,
                     allowSystemPanels: layoutEngine.document.globalSettings.allowSystemPanels
                 )
@@ -190,6 +205,12 @@ struct DashboardShell: View {
         // by parking a widget on a full page); the local flag just mirrors it
         // for gesture gating and overlays.
         .onChange(of: layoutEngine.isEditing) { _, editing in
+            // Esc and Cmd-Z work while editing; focus returns when you're done.
+            if editing {
+                DashboardFocus.takeKeyboard(holder: "edit")
+            } else {
+                DashboardFocus.returnKeyboard(holder: "edit")
+            }
             withAnimation(.easeInOut(duration: 0.2)) {
                 editMode = editing
             }
@@ -312,7 +333,11 @@ struct DashboardShell: View {
                 label: "\n",
                 isActive: editMode,
                 activeColor: accent,
-                registry: model.touchService.zoneRegistry
+                registry: model.touchService.zoneRegistry,
+                accessibilityName: editMode ? "Done editing layout" : "Edit layout",
+                // 36-pt buttons 6 pt apart: taps in the gap and just below them
+                // missed (6 of 11 in the 2026-10-11 touch log).
+                hitSlop: CGSize(width: 3, height: 8)
             ) {
                 // The zone registry runs actions on the main actor, but the
                 // closure itself is @Sendable, so hop explicitly for Swift 6.
@@ -349,7 +374,9 @@ struct DashboardShell: View {
                 label: "\n",
                 isActive: false,
                 activeColor: accent,
-                registry: model.touchService.zoneRegistry
+                registry: model.touchService.zoneRegistry,
+                accessibilityName: "Settings",
+                hitSlop: CGSize(width: 3, height: 8)
             ) {
                 DispatchQueue.main.async {
                     SettingsWindowController.shared.show()

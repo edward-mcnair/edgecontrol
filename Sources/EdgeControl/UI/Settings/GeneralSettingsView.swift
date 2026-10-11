@@ -49,10 +49,12 @@ struct GeneralSettingsView: View {
                 }
             }
 
+            CalibrationSettingsRow(service: model.touchService, accent: accent)
+
             // Debug mode
             settingsToggle(
                 "Debug Mode",
-                subtitle: "Show diagnostic overlays and touch zones",
+                subtitle: "Records raw touchscreen data to the touch log, for diagnosing touch problems",
                 icon: "ant",
                 isOn: Binding(
                     get: { layoutEngine.document.globalSettings.debugMode },
@@ -60,6 +62,7 @@ struct GeneralSettingsView: View {
                         var gs = layoutEngine.document.globalSettings
                         gs.debugMode = newValue
                         layoutEngine.updateGlobalSettings(gs)
+                        model.touchService.setDiagnostics(newValue)
                     }
                 )
             )
@@ -97,6 +100,43 @@ struct GeneralSettingsView: View {
                         var gs = layoutEngine.document.globalSettings
                         gs.allowSystemPanels = newValue
                         layoutEngine.updateGlobalSettings(gs)
+                    }
+                )
+            )
+
+            // Focus behaviour
+            settingsToggle(
+                "Dashboard Never Takes Focus",
+                subtitle:
+                    "Apps you open appear on the display you're working on, not behind the dashboard. Turn off if typing on the dashboard misbehaves",
+                icon: "rectangle.on.rectangle.slash",
+                isOn: Binding(
+                    get: { layoutEngine.document.globalSettings.dashboardNeverTakesFocus },
+                    set: { newValue in
+                        var gs = layoutEngine.document.globalSettings
+                        gs.dashboardNeverTakesFocus = newValue
+                        layoutEngine.updateGlobalSettings(gs)
+                        NotificationCenter.default.post(name: DashboardFocus.settingChanged, object: nil)
+                    }
+                )
+            )
+
+            // Accessibility fallback
+            settingsToggle(
+                "Always Available to Accessibility Tools",
+                subtitle:
+                    "Voice Control, Full Keyboard Access and VoiceOver are detected automatically. Turn on if one of them can't see the dashboard",
+                icon: "accessibility",
+                isOn: Binding(
+                    get: { layoutEngine.document.globalSettings.alwaysExposeAccessibility },
+                    set: { newValue in
+                        var gs = layoutEngine.document.globalSettings
+                        gs.alwaysExposeAccessibility = newValue
+                        layoutEngine.updateGlobalSettings(gs)
+                        AccessibilityExposure.alwaysExpose = newValue
+                        if let dashboard = DashboardFocus.dashboard {
+                            NSAccessibility.post(element: dashboard, notification: .layoutChanged)
+                        }
                     }
                 )
             )
@@ -292,7 +332,9 @@ struct GeneralSettingsView: View {
 
             Spacer()
 
-            Toggle("", isOn: isOn)
+            // Titled for VoiceOver; the visible title is the text beside it.
+            Toggle(title, isOn: isOn)
+                .labelsHidden()
                 .toggleStyle(.switch)
                 .tint(accent)
         }
@@ -346,5 +388,39 @@ struct GeneralSettingsView: View {
                 layoutEngine.document = doc
             }
         }
+    }
+}
+
+private struct CalibrationSettingsRow: View {
+    @ObservedObject var service: HardwareTouchService
+    let accent: Color
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "hand.point.up.left")
+                .font(.system(size: 16)).foregroundStyle(accent).frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Touch Calibration")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded)).foregroundStyle(.white)
+                Text(
+                    service.calibrationNotice.isEmpty
+                        ? "Improve touch accuracy from your normal seated position"
+                        : service.calibrationNotice
+                )
+                .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundStyle(Theme.textTertiary)
+                if !service.touchNotice.isEmpty {
+                    Text(service.touchNotice)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Theme.accentOrange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer()
+            Button("Calibrate…") {
+                service.beginGuidedCalibration()
+                if service.guidedCalibration != nil { SettingsWindowController.shared.close() }
+            }.tint(accent)
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }

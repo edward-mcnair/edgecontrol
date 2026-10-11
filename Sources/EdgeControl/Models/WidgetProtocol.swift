@@ -395,7 +395,7 @@ public enum WidgetLaunch {
         name.contains("Activity Monitor")
     }
     /// Widgets whose taps already do something keep their behavior.
-    public static let excluded: Set<String> = ["cicd-runs"]
+    public static let excluded: Set<String> = ["cicd-runs", "youtube", "apple-music", "application-launcher"]
 
     public static func defaultApp(for widgetId: String) -> String {
         switch widgetId {

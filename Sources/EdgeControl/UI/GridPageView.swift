@@ -57,6 +57,14 @@ struct GridPageView: View {
                         if commandHeld != held { commandHeld = held }
                     }
                     .background(EditKeyCatcher(layoutEngine: layoutEngine))
+                Color.clear.frame(width: 0, height: 0)
+                    .onAppear { syncEditTouch(frame: geo.frame(in: .named(TouchCoordinate.name))) }
+                    .onChange(
+                        of: EditTouchKey(
+                            editing: editMode, current: layoutEngine.currentPage?.id == page.id,
+                            frame: geo.frame(in: .named(TouchCoordinate.name)))
+                    ) { _, key in syncEditTouch(frame: key.frame) }
+                    .onDisappear { EditTouchRouting.shared.unregister(pageId: page.id) }
 
                 // Drop / resize target highlights. These are the only views
                 // that observe the live gesture targets, so a drag tick
@@ -91,6 +99,12 @@ struct GridPageView: View {
                             // their state back through the layout engine.
                             let cfg: WidgetConfig = {
                                 var c = placement.config
+                                c["_mediaEditing"] = .bool(editMode)
+                                // Touch is off while another widget is expanded;
+                                // playback only stops when the page isn't shown.
+                                c["_mediaActive"] = .bool(
+                                    layoutEngine.currentPage?.id == page.id && layoutEngine.focusedWidget == nil)
+                                c["_mediaVisible"] = .bool(layoutEngine.currentPage?.id == page.id)
                                 c["_pageId"] = .string(page.id)
                                 c["_instanceId"] = .string(placement.instanceId)
                                 return c
@@ -127,6 +141,9 @@ struct GridPageView: View {
                         // Compact layouts at large font scales can overflow a
                         // 1-row cell; never let a widget paint over neighbors.
                         .clipped()
+                        // One named container per card for VoiceOver.
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel(registry.widget(for: placement.widgetId)?.displayName ?? "Widget")
                         .opacity(isDragging ? 0.5 : isResizing ? 0.7 : 1)
                         .overlay {
                             if editMode {
@@ -300,7 +317,7 @@ struct GridPageView: View {
                             .foregroundStyle(overlappedIds.isEmpty ? accent : Theme.accentOrange)
                         Text(
                             overlappedIds.isEmpty
-                                ? "— drag widgets to reposition"
+                                ? "— drag to move · drag the corner to resize · tap ✕ to remove"
                                 : "— separate overlapping widgets to finish"
                         )
                         .font(.system(size: 11, weight: .medium, design: .rounded))
@@ -338,133 +355,231 @@ struct GridPageView: View {
     private func dragGesture(placement: WidgetPlacement, cellW: CGFloat, cellH: CGFloat) -> some Gesture {
         DragGesture()
             .onChanged { value in
-                // Page state changes once, on the first tick; the equality
-                // guards keep later ticks from re-rendering the page.
-                if draggingInstanceId != placement.instanceId { draggingInstanceId = placement.instanceId }
-                if selectedInstanceId != placement.instanceId { selectedInstanceId = placement.instanceId }
-
-                // Calculate target grid cell from drag position
-                let newCol = placement.col + Int(round(value.translation.width / cellW))
-                let newRow = placement.row + Int(round(value.translation.height / cellH))
-                let clampedCol = max(0, min(newCol, gridColumns - placement.width))
-                let clampedRow = max(0, min(newRow, gridRows - placement.height))
-
-                targets.setDrag(
-                    EditTargets.Target(
-                        col: clampedCol, row: clampedRow,
-                        width: placement.width, height: placement.height,
-                        isValid: layoutEngine.isValidPlacement(
-                            pageId: page.id,
-                            col: clampedCol,
-                            row: clampedRow,
-                            width: placement.width,
-                            height: placement.height,
-                            excludeInstanceId: placement.instanceId
-                        )
-                    ))
+                previewMove(placement, translation: value.translation, cellW: cellW, cellH: cellH)
             }
-            .onEnded { value in
-                // Apply move if valid
-                if let target = targets.drag, target.isValid {
-                    layoutEngine.moveWidget(
-                        pageId: page.id,
-                        instanceId: placement.instanceId,
-                        toCol: target.col,
-                        toRow: target.row
-                    )
-                    // Anything the drop landed on steps aside to its
-                    // nearest free spot; no room means it stays staged.
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        layoutEngine.resolveOverlaps(
-                            pageId: page.id, keeping: placement.instanceId,
-                            minSize: { registry.widget(for: $0)?.supportedSizes.min }
-                        )
+            .onEnded { _ in finishMove(placement) }
+    }
+
+    // MARK: - Move / Resize (shared by mouse gestures and hardware touch)
+
+    private func previewMove(_ placement: WidgetPlacement, translation: CGSize, cellW: CGFloat, cellH: CGFloat) {
+        // Page state changes once, on the first tick; the equality
+        // guards keep later ticks from re-rendering the page.
+        if draggingInstanceId != placement.instanceId { draggingInstanceId = placement.instanceId }
+        if selectedInstanceId != placement.instanceId { selectedInstanceId = placement.instanceId }
+
+        // Calculate target grid cell from drag position
+        let newCol = placement.col + Int(round(translation.width / cellW))
+        let newRow = placement.row + Int(round(translation.height / cellH))
+        let clampedCol = max(0, min(newCol, gridColumns - placement.width))
+        let clampedRow = max(0, min(newRow, gridRows - placement.height))
+
+        targets.setDrag(
+            EditTargets.Target(
+                col: clampedCol, row: clampedRow,
+                width: placement.width, height: placement.height,
+                isValid: layoutEngine.isValidPlacement(
+                    pageId: page.id,
+                    col: clampedCol,
+                    row: clampedRow,
+                    width: placement.width,
+                    height: placement.height,
+                    excludeInstanceId: placement.instanceId
+                )
+            ))
+    }
+
+    private func finishMove(_ placement: WidgetPlacement) {
+        // Apply move if valid
+        if let target = targets.drag, target.isValid {
+            layoutEngine.moveWidget(
+                pageId: page.id,
+                instanceId: placement.instanceId,
+                toCol: target.col,
+                toRow: target.row
+            )
+            // Anything the drop landed on steps aside to its
+            // nearest free spot; no room means it stays staged.
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                layoutEngine.resolveOverlaps(
+                    pageId: page.id, keeping: placement.instanceId,
+                    minSize: { registry.widget(for: $0)?.supportedSizes.min }
+                )
+            }
+        }
+
+        // Reset drag state (the card never moved — it dims in
+        // place and jumps to its new cell on drop)
+        withAnimation(.easeOut(duration: 0.2)) {
+            draggingInstanceId = nil
+            targets.setDrag(nil)
+        }
+    }
+
+    private func previewResize(_ placement: WidgetPlacement, translation: CGSize, cellW: CGFloat, cellH: CGFloat) {
+        if resizingInstanceId != placement.instanceId { resizingInstanceId = placement.instanceId }
+        if selectedInstanceId != placement.instanceId { selectedInstanceId = placement.instanceId }
+        let deltaW = Int(round(translation.width / cellW))
+        let deltaH = Int(round(translation.height / cellH))
+        let newW = max(1, placement.width + deltaW)
+        let newH = max(1, placement.height + deltaH)
+        let clampedW = min(newW, gridColumns - placement.col)
+        let clampedH = min(newH, gridRows - placement.row)
+
+        // Valid = a size the widget supports that
+        // also stays on the grid.
+        var isValid = false
+        if let meta = registry.metadata(for: placement.widgetId) {
+            let sizeOk = meta.supportedSizes.contains(
+                WidgetSize(width: clampedW, height: clampedH))
+            let noCollision = layoutEngine.isValidPlacement(
+                pageId: page.id,
+                col: placement.col,
+                row: placement.row,
+                width: clampedW,
+                height: clampedH,
+                excludeInstanceId: placement.instanceId
+            )
+            isValid = sizeOk && noCollision
+        }
+        targets.setResize(
+            EditTargets.Target(
+                col: placement.col, row: placement.row,
+                width: clampedW, height: clampedH, isValid: isValid
+            ))
+    }
+
+    private func finishResize(_ placement: WidgetPlacement) {
+        if let target = targets.resize, target.isValid {
+            layoutEngine.resizeWidget(
+                pageId: page.id,
+                instanceId: placement.instanceId,
+                newWidth: target.width,
+                newHeight: target.height
+            )
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                layoutEngine.resolveOverlaps(
+                    pageId: page.id, keeping: placement.instanceId,
+                    minSize: { registry.widget(for: $0)?.supportedSizes.min }
+                )
+            }
+        }
+        withAnimation(.easeOut(duration: 0.2)) {
+            resizingInstanceId = nil
+            targets.setResize(nil)
+        }
+    }
+
+    private func cancelEditGesture() {
+        draggingInstanceId = nil
+        resizingInstanceId = nil
+        targets.setDrag(nil)
+        targets.setResize(nil)
+    }
+
+    // MARK: - Hardware Touch Editing
+
+    /// Registers this page with EditTouchRouting while it is the visible page
+    /// in edit mode, so a finger can do what the mouse gestures do.
+    private func syncEditTouch(frame: CGRect) {
+        guard editMode, layoutEngine.currentPage?.id == page.id, frame.width > 0, frame.height > 0 else {
+            EditTouchRouting.shared.unregister(pageId: page.id)
+            return
+        }
+        let cellW = frame.width / CGFloat(gridColumns)
+        let cellH = frame.height / CGFloat(gridRows)
+        EditTouchRouting.shared.register(
+            EditTouchRouting.Surface(
+                pageId: page.id,
+                origin: frame.origin,
+                hitTest: { editHit(at: $0, cellW: cellW, cellH: cellH) },
+                update: { hit, translation in
+                    guard let placement = livePlacement(hit.instanceId) else { return }
+                    if hit.part == .resize {
+                        previewResize(placement, translation: translation, cellW: cellW, cellH: cellH)
+                    } else {
+                        previewMove(placement, translation: translation, cellW: cellW, cellH: cellH)
                     }
-                }
+                },
+                finish: { hit, translation, moved in
+                    guard let placement = livePlacement(hit.instanceId) else { return cancelEditGesture() }
+                    switch (hit.part, moved) {
+                    case (.remove, false):
+                        selectedInstanceId = nil
+                        layoutEngine.removeWidget(pageId: page.id, instanceId: placement.instanceId)
+                    case (.resize, true):
+                        finishResize(placement)
+                    case (.body, true):
+                        finishMove(placement)
+                    default:
+                        // A tap (or a drag off the ✕) selects, like a click.
+                        cancelEditGesture()
+                        selectedInstanceId = placement.instanceId
+                    }
+                },
+                cancel: { cancelEditGesture() }
+            ))
+    }
 
-                // Reset drag state (the card never moved — it dims in
-                // place and jumps to its new cell on drop)
-                withAnimation(.easeOut(duration: 0.2)) {
-                    draggingInstanceId = nil
-                    targets.setDrag(nil)
-                }
+    private func livePlacement(_ instanceId: String) -> WidgetPlacement? {
+        layoutEngine.document.pages.first { $0.id == page.id }?.widgets.first { $0.instanceId == instanceId }
+    }
+
+    /// Page-local hit test, topmost first: the selected widget floats above
+    /// the rest, then later widgets draw over earlier ones. The ✕ and the
+    /// resize corner get finger-sized targets larger than their glyphs.
+    private func editHit(at point: CGPoint, cellW: CGFloat, cellH: CGFloat) -> EditTouchRouting.Hit? {
+        guard let widgets = layoutEngine.document.pages.first(where: { $0.id == page.id })?.widgets else { return nil }
+        var ordered = Array(widgets.reversed())
+        if let selected = selectedInstanceId, let index = ordered.firstIndex(where: { $0.instanceId == selected }) {
+            ordered.insert(ordered.remove(at: index), at: 0)
+        }
+        for placement in ordered where registry.widget(for: placement.widgetId) != nil {
+            let frame = CGRect(
+                x: CGFloat(placement.col) * cellW, y: CGFloat(placement.row) * cellH,
+                width: CGFloat(placement.width) * cellW, height: CGFloat(placement.height) * cellH)
+            guard frame.contains(point) else { continue }
+            let id = placement.instanceId
+            if CGRect(x: frame.maxX - 48, y: frame.minY, width: 48, height: 48).contains(point) {
+                return .init(instanceId: id, part: .remove)
             }
+            if CGRect(x: frame.maxX - 60, y: frame.maxY - 60, width: 60, height: 60).contains(point) {
+                return .init(instanceId: id, part: .resize)
+            }
+            return .init(instanceId: id, part: .body)
+        }
+        return nil
     }
 
     // MARK: - Resize Handle
 
     private func resizeHandle(placement: WidgetPlacement, cellW: CGFloat, cellH: CGFloat) -> some View {
-        // Bottom-right corner drag handle
+        // Bottom-right corner drag handle, sized for a finger as well as the
+        // mouse (hardware touch uses a 60-point corner target, see editHit).
         VStack {
             Spacer()
             HStack {
                 Spacer()
-                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                    .font(.system(size: 10, weight: .bold))
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(Theme.accentPurple)
-                    .frame(width: 22, height: 22)
+                    .frame(width: 36, height: 36)
                     .background(
-                        Theme.accentPurple.opacity(0.2), in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        Theme.accentPurple.opacity(0.25), in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .strokeBorder(Theme.accentPurple.opacity(0.4), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Theme.accentPurple.opacity(0.5), lineWidth: 1)
                     )
+                    .contentShape(Rectangle())
+                    .help("Drag to resize")
+                    .accessibilityLabel("Resize")
                     .gesture(
                         DragGesture()
                             .onChanged { value in
-                                if resizingInstanceId != placement.instanceId {
-                                    resizingInstanceId = placement.instanceId
-                                }
-                                let deltaW = Int(round(value.translation.width / cellW))
-                                let deltaH = Int(round(value.translation.height / cellH))
-                                let newW = max(1, placement.width + deltaW)
-                                let newH = max(1, placement.height + deltaH)
-                                let clampedW = min(newW, gridColumns - placement.col)
-                                let clampedH = min(newH, gridRows - placement.row)
-
-                                // Valid = a size the widget supports that
-                                // also stays on the grid.
-                                var isValid = false
-                                if let meta = registry.metadata(for: placement.widgetId) {
-                                    let sizeOk = meta.supportedSizes.contains(
-                                        WidgetSize(width: clampedW, height: clampedH))
-                                    let noCollision = layoutEngine.isValidPlacement(
-                                        pageId: page.id,
-                                        col: placement.col,
-                                        row: placement.row,
-                                        width: clampedW,
-                                        height: clampedH,
-                                        excludeInstanceId: placement.instanceId
-                                    )
-                                    isValid = sizeOk && noCollision
-                                }
-                                targets.setResize(
-                                    EditTargets.Target(
-                                        col: placement.col, row: placement.row,
-                                        width: clampedW, height: clampedH, isValid: isValid
-                                    ))
+                                previewResize(placement, translation: value.translation, cellW: cellW, cellH: cellH)
                             }
-                            .onEnded { _ in
-                                if let target = targets.resize, target.isValid {
-                                    layoutEngine.resizeWidget(
-                                        pageId: page.id,
-                                        instanceId: placement.instanceId,
-                                        newWidth: target.width,
-                                        newHeight: target.height
-                                    )
-                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                                        layoutEngine.resolveOverlaps(
-                                            pageId: page.id, keeping: placement.instanceId,
-                                            minSize: { registry.widget(for: $0)?.supportedSizes.min }
-                                        )
-                                    }
-                                }
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    resizingInstanceId = nil
-                                    targets.setResize(nil)
-                                }
-                            }
+                            .onEnded { _ in finishResize(placement) }
                     )
                     .padding(4)
             }
@@ -674,4 +789,11 @@ private struct EditKeyCatcher: NSViewRepresentable {
             }
         }
     }
+}
+
+/// What the hardware-touch edit surface depends on.
+private struct EditTouchKey: Equatable {
+    let editing: Bool
+    let current: Bool
+    let frame: CGRect
 }

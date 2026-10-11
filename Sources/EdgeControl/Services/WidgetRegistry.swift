@@ -95,10 +95,13 @@ public final class WidgetRegistry: ObservableObject {
         register(BluetoothWidget(service: model.bluetoothService))
 
         // Media
+        register(YouTubeWidget())
+        register(AppleMusicWidget())
         register(NowPlayingWidget(service: model.nowPlayingService))
         register(AudioDevicesWidget(service: model.audioService))
 
         // Info
+        register(ApplicationLauncherWidget())
         register(WeatherWidget(service: model.weatherService))
         register(ClockWidget())
         register(WorldClocksWidget())
