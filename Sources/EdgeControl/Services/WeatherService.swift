@@ -101,6 +101,12 @@ public final class WeatherDataService: ObservableObject {
     public func start() {
         stop()
         running = true
+        // Allowing location in the prompt or in System Settings refreshes
+        // the forecast straight away, not at the next 15-minute refresh.
+        locationManager.onAuthorizationChange = { [weak self] in
+            guard let self, self.running, self.locationNote != nil else { return }
+            self.fetch()
+        }
         fetch()
         // Refresh every 15 minutes
         timer = Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in
@@ -192,11 +198,15 @@ public final class WeatherDataService: ObservableObject {
             return (location, nil)
         }
         if let saved = UserDefaults.standard.array(forKey: Self.lastLocationKey) as? [Double], saved.count == 2 {
-            return (CLLocation(latitude: saved[0], longitude: saved[1]),
-                    "Location unavailable: showing your last known location.")
+            return (
+                CLLocation(latitude: saved[0], longitude: saved[1]),
+                "Location unavailable: showing your last known location."
+            )
         }
-        return (CLLocation(latitude: 51.5074, longitude: -0.1278),
-                "Location unavailable: showing London. Allow Location Services for EdgeControl Media in System Settings → Privacy & Security.")
+        return (
+            CLLocation(latitude: 51.5074, longitude: -0.1278),
+            "Location unavailable: showing London. Allow Location Services for EdgeControl Media in System Settings → Privacy & Security."
+        )
     }
 
     // MARK: - WMO Weather Code Mapping
@@ -309,5 +319,12 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         MainActor.assumeIsolated { finish(.failure(error)) }
+    }
+
+    /// Called when you allow (or deny) location, in the prompt or Settings.
+    var onAuthorizationChange: (() -> Void)?
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        MainActor.assumeIsolated { onAuthorizationChange?() }
     }
 }
